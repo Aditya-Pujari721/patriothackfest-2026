@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="AquaSpec">
+  <link rel="manifest" href="./manifest.json">
+  <title>AquaSpec</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Courier New', Courier, monospace; border-radius: 0; }
+    body { background: #0a0a0a; color: #e5e5e5; padding: 14px; max-width: 480px; margin: 0 auto; }
+    .header { border-bottom: 1px solid #262626; padding-bottom: 10px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: baseline; }
+    .header h1 { font-size: 16px; font-weight: normal; color: #ffffff; }
+    .meta { font-size: 11px; color: #737373; }
+    .viewfinder { position: relative; width: 100%; aspect-ratio: 3/4; background: #000000; border: 1px solid #262626; overflow: hidden; margin-bottom: 10px; }
+    video { width: 100%; height: 100%; object-fit: cover; }
+    .roi-box { position: absolute; left: 30%; width: 40%; top: 38%; height: 28%; border: 1px solid #22c55e; pointer-events: none; }
+    .btn { width: 100%; padding: 12px; font-size: 12px; background: #171717; color: #ffffff; border: 1px solid #404040; cursor: pointer; margin-bottom: 8px; }
+    .btn:disabled { color: #525252; border-color: #262626; }
+    .btn-primary { background: #ffffff; color: #0a0a0a; border-color: #ffffff; }
+    .btn-primary:disabled { background: #262626; color: #737373; border-color: #262626; }
+    .card { border: 1px solid #262626; padding: 12px; margin-top: 10px; display: none; background: #0f0f0f; }
+    .status-line { padding: 8px; font-size: 12px; margin-bottom: 10px; border: 1px solid #262626; text-align: center; }
+    .status-safe { background: #052e16; color: #86efac; border-color: #166534; }
+    .status-hazard { background: #450a0a; color: #fca5a5; border-color: #991b1b; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    .metric { border: 1px solid #262626; padding: 8px; background: #0a0a0a; }
+    .metric-label { font-size: 10px; color: #737373; margin-bottom: 4px; }
+    .metric-val { font-size: 15px; color: #ffffff; }
+    canvas#hudCanvas { width: 100%; border: 1px solid #262626; display: block; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>AquaSpec</h1>
+    <div id="cacheStatus" class="meta" role="status">Preparing offline copy...</div>
+  </header>
+  <div id="waterPanel">
+    <div class="viewfinder">
+      <video id="cam" autoplay playsinline muted></video>
+      <div class="roi-box"></div>
+    </div>
+    <div id="scanHint" role="status" style="font-size:12px;margin:8px 0">Starting camera…</div>
+    <button disabled id="scanWaterBtn" class="btn btn-primary" onclick="runOnDeviceWaterScan(false)">Scan Water</button>
+    <button disabled id="tareWaterBtn" class="btn" onclick="runOnDeviceWaterScan(true)">Calibrate Clean Baseline</button>
+
+    <div id="captureStatus" class="meta" role="status">Debug captures enabled</div>
+    <button hidden id="exportCaptures" class="btn" onclick="exportCaptures()">Download debug captures</button>
+    <div id="resultCard" class="card">
+      <div id="statusBanner" class="status-line"></div>
+      <div class="grid">
+        <div class="metric">
+          <div class="metric-label">Estimated turbidity</div>
+          <div id="m1Val" class="metric-val">--</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Chromatic Tint</div>
+          <div id="m2Val" class="metric-val">--</div>
+        </div>
+      </div>
+      <canvas id="hudCanvas" width="480" height="640"></canvas>
+    </div>
+  </div>
+
+<script src="./captures.js"></script>
+<script>
+  async function prepareOffline() {
+    const status = document.getElementById('cacheStatus');
+    try {
+      if (!navigator.serviceWorker) throw new Error('Use a trusted HTTPS address.');
+      // On an offline reload, use the installed worker without checking the network.
+      const existing = await navigator.serviceWorker.getRegistration();
+      if (!existing) await navigator.serviceWorker.register('./sw.js');
+      if (existing && navigator.onLine) existing.update().catch(() => {});
+      const ready = await navigator.serviceWorker.ready;
+      const channel = new MessageChannel();
+      const confirmed = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Reconnect and reload.')), 8000);
+        channel.port1.onmessage = event => {
+          clearTimeout(timeout);
+          channel.port1.close();
+          resolve(event.data === 'cached');
+        };
+      });
+      ready.active.postMessage('check-cache', [channel.port2]);
+      if (!await confirmed) throw new Error('Reconnect and reload.');
+      status.textContent = 'Ready for offline use';
+    } catch (error) {
+      status.textContent = 'Offline copy unavailable. ' + error.message;
+    }
+  }
+  if (location.pathname.startsWith('/live/')) {
+    document.getElementById('cacheStatus').textContent = 'Live laptop capture';
+  } else {
+    prepareOffline();
+  }
+  const NTU_HAZARD_THRESHOLD = 1.0;
+  const TINT_HAZARD_THRESHOLD = 50.0;
+  let baselineMeanIntensity = Number(localStorage.getItem('aq_base_i') ?? 133.0);
+  let baselineValleyRatio   = Number(localStorage.getItem('aq_base_v') ?? 0.76);
+  let baselineLogRB         = Number(localStorage.getItem('aq_base_rb') ?? 0.018);
+  let videoStream = null;
+  async function initCam() {
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } }, audio: false
+      });
+      document.getElementById('cam').srcObject = videoStream;
+      await document.getElementById('cam').play();
+      document.getElementById('scanWaterBtn').disabled = false;
+      document.getElementById('tareWaterBtn').disabled = false;
+      document.getElementById('scanHint').textContent = 'Align the glass in the box. Keep the flashlight outside the box and use the same lighting for each scan.';
+    } catch (e) {
+      document.getElementById('scanHint').textContent = 'Camera unavailable. Open the HTTPS address, allow camera access, then reload. ' + e.message;
+    }
+  }
+  initCam();
+
+  async function runOnDeviceWaterScan(isCalibration) {
+    try {
+      await captureWater(isCalibration);
+    } catch (error) {
+      document.getElementById('scanHint').textContent = 'Scan interrupted: ' + error.message;
+    } finally {
+      document.getElementById('scanWaterBtn').disabled = false;
+      document.getElementById('scanWaterBtn').textContent = 'Scan Water';
+      document.getElementById('tareWaterBtn').disabled = false;
+    }
+  }
+  async function captureWater(isCalibration) {
+    const video = document.getElementById('cam');
+    if (!videoStream || video.readyState < 2) return;
+
+    const scanBtn = document.getElementById('scanWaterBtn');
+    const tareBtn = document.getElementById('tareWaterBtn');
+    scanBtn.disabled = true; tareBtn.disabled = true;
+    (isCalibration ? tareBtn : scanBtn).innerText = "Sampling...";
+
+    const W = 480, H = 640;
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = W; offCanvas.height = H;
+    const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+
+    const totalFrames = 30, settledStart = 15, settledCount = totalFrames - settledStart;
+    const accumRGB = new Float32Array(W * H * 3);
+
+    for (let f = 0; f < totalFrames; f++) {
+      const vw = video.videoWidth || 480, vh = video.videoHeight || 640;
+      const targetAspect = 3.0 / 4.0, currentAspect = vw / vh;
+      let sx = 0, sy = 0, sw = vw, sh = vh;
+      if (currentAspect > targetAspect) { sw = Math.floor(vh * targetAspect); sx = Math.floor((vw - sw) / 2); }
+      else if (currentAspect < targetAspect) { sh = Math.floor(vw / targetAspect); sy = Math.floor((vh - sh) / 2); }
+      offCtx.drawImage(video, sx, sy, sw, sh, 0, 0, W, H);
+
+      if (f >= settledStart) {
+        const d = offCtx.getImageData(0, 0, W, H).data;
+        for (let p = 0, j = 0; p < d.length; p += 4, j += 3) {
+          accumRGB[j] += d[p]; accumRGB[j + 1] += d[p + 1]; accumRGB[j + 2] += d[p + 2];
+        }
+      }
+      await new Promise(r => setTimeout(r, 60));
+    }
+
+    const avgRGB = new Uint8ClampedArray(W * H * 3);
+    for (let j = 0; j < accumRGB.length; j++) avgRGB[j] = Math.floor(accumRGB[j] / settledCount);
+
+    const x1 = Math.floor(W * 0.30), x2 = Math.floor(W * 0.70);
+    const y1 = Math.floor(H * 0.38), y2 = Math.floor(H * 0.66);
+    const roiW = x2 - x1, roiH = y2 - y1;
+    const ry1 = Math.floor(roiH * 0.35), ry2 = Math.floor(roiH * 0.90), stripRows = ry2 - ry1;
+
+    const rProf = new Float32Array(roiW), gProf = new Float32Array(roiW), bProf = new Float32Array(roiW), iProf = new Float32Array(roiW);
+    let sumIntensity = 0;
+
+    for (let ry = 0; ry < roiH; ry++) {
+      const py = y1 + ry, inStrip = (ry >= ry1 && ry < ry2);
+      for (let rx = 0; rx < roiW; rx++) {
+        const idx = (py * W + (x1 + rx)) * 3;
+        const r = avgRGB[idx], g = avgRGB[idx + 1], b = avgRGB[idx + 2];
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        sumIntensity += lum;
+        if (inStrip) { rProf[rx] += r; gProf[rx] += g; bProf[rx] += b; iProf[rx] += lum; }
+      }
+    }
+    for (let rx = 0; rx < roiW; rx++) { rProf[rx] /= stripRows; gProf[rx] /= stripRows; bProf[rx] /= stripRows; iProf[rx] /= stripRows; }
+
+    const meanIntensity = sumIntensity / (roiW * roiH);
+    const cStart = Math.floor(roiW * 0.30), cEnd = Math.floor(roiW * 0.70);
+    const eLeftEnd = Math.floor(roiW * 0.22), eRightStart = Math.floor(roiW * 0.78);
+    let cSum = 0, eLeftSum = 0, eRightSum = 0;
+    for (let x = cStart; x < cEnd; x++) cSum += iProf[x];
+    for (let x = 0; x < eLeftEnd; x++) eLeftSum += iProf[x];
+    for (let x = eRightStart; x < roiW; x++) eRightSum += iProf[x];
+    const valleyRatio = (cSum / (cEnd - cStart)) / (0.5 * ((eLeftSum / eLeftEnd) + (eRightSum / (roiW - eRightStart))) + 1e-5);
+
+    let sumLogRB = 0;
+    for (let x = 0; x < roiW; x++) sumLogRB += Math.log((0.7 * rProf[x] + 0.3 * gProf[x] + 4.0) / (bProf[x] + 4.0));
+    const meanLogRB = sumLogRB / roiW;
+
+    const ntu = 0.20 + (Math.max(0.0, meanIntensity - (baselineMeanIntensity + 6.0)) * 0.18) + (Math.max(0.0, valleyRatio - (baselineValleyRatio + 0.06)) * 12.0);
+    const tintIndex = Math.min(1500.0, Math.max(10.0, 12.0 + (Math.max(0.0, meanLogRB - (baselineLogRB + 0.010)) * 2400.0)));
+    const hudCanvas = document.getElementById('hudCanvas');
+    const hCtx = hudCanvas.getContext('2d');
+    const hudImg = hCtx.createImageData(W, H);
+    for (let p = 0, j = 0; p < hudImg.data.length; p += 4, j += 3) {
+      hudImg.data[p] = avgRGB[j]; hudImg.data[p + 1] = avgRGB[j + 1]; hudImg.data[p + 2] = avgRGB[j + 2]; hudImg.data[p + 3] = 255;
+    }
+    hCtx.putImageData(hudImg, 0, 0);
+    const raw = hudCanvas.toDataURL('image/jpeg', 0.92).split(',')[1];
+    const metrics = {
+      is_calibration: isCalibration, mean_intensity: meanIntensity,
+      baseline_mean_intensity: baselineMeanIntensity, valley_ratio: valleyRatio,
+      baseline_valley_ratio: baselineValleyRatio, mean_log_rb: meanLogRB,
+      baseline_log_rb: baselineLogRB, delta_log_rb: meanLogRB - baselineLogRB,
+      ntu, tint_index: tintIndex
+    };
+    const isTurbid = ntu >= NTU_HAZARD_THRESHOLD;
+    const isTinted = tintIndex >= TINT_HAZARD_THRESHOLD;
+    const isHazard = isTurbid || isTinted;
+    document.querySelector('.roi-box').style.border = '3px solid ' + (isHazard ? '#ef4444' : '#22c55e');
+    hCtx.strokeStyle = isHazard ? '#ef4444' : '#22c55e'; hCtx.lineWidth = 2;
+    hCtx.strokeRect(x1, y1, roiW, roiH);
+    hCtx.strokeStyle = '#eab308'; hCtx.lineWidth = 2; hCtx.beginPath();
+    for (let px = 0; px < roiW; px++) {
+      const py = y2 - Math.min(1, Math.max(0, iProf[px] / 255.0)) * (roiH - 10);
+      px === 0 ? hCtx.moveTo(x1 + px, py) : hCtx.lineTo(x1 + px, py);
+    }
+    hCtx.stroke();
+
+    const hud = hudCanvas.toDataURL('image/jpeg', 0.92).split(',')[1];
+    if (isCalibration) {
+      baselineMeanIntensity = meanIntensity; baselineValleyRatio = valleyRatio; baselineLogRB = meanLogRB;
+      localStorage.setItem('aq_base_i', baselineMeanIntensity);
+      localStorage.setItem('aq_base_v', baselineValleyRatio);
+      localStorage.setItem('aq_base_rb', baselineLogRB);
+      document.getElementById('resultCard').style.display = 'none';
+      document.querySelector('.roi-box').style.border = '';
+      document.getElementById('scanHint').textContent = 'Clean baseline saved on this device.';
+      tareBtn.innerText = `Calibrated (I=${baselineMeanIntensity.toFixed(1)})`;
+      metrics.result = 'Clean baseline calibration';
+      await storeCapture(metrics, raw, hud);
+      return;
+    }
+
+    document.getElementById('resultCard').style.display = 'block';
+    const banner = document.getElementById('statusBanner');
+    if (isTurbid && isTinted) banner.innerText = "Turbid and tinted water detected";
+    else if (isTurbid) banner.innerText = "Turbid water detected";
+    else if (isTinted) banner.innerText = "Tinted water detected";
+    else banner.innerText = "Visually clean water";
+    banner.className = `status-line ${isHazard ? 'status-hazard' : 'status-safe'}`;
+    document.getElementById('m1Val').innerText = `${ntu.toFixed(2)} NTU`;
+    document.getElementById('m2Val').innerText = `${Math.round(tintIndex)}`;
+    document.getElementById('scanHint').textContent = banner.innerText;
+    metrics.result = banner.innerText;
+    await storeCapture(metrics, raw, hud);
+  }
+</script>
+</body>
+</html>
